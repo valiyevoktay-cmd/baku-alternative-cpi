@@ -1,58 +1,76 @@
 import logging
-from datetime import datetime, timedelta
-import random
+import time
+from datetime import datetime
 from database import get_engine, get_session, Product, PriceHistory
+from scraper import PriceScraper
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
-logger = logging.getLogger("ETL")
+logger = logging.getLogger("ETL_Production")
 
 def run_etl():
     engine = get_engine()
     session = get_session(engine)
+    scraper = PriceScraper() # Initialize our scraper
     
     try:
-        # 1. Заполняем корзину, если база пустая
+        # 1. Base basket with REAL links
         if session.query(Product).count() == 0:
-            logger.info("Создаем базовую корзину товаров...")
+            logger.info("Creating base basket with real products...")
             session.add_all([
-                Product(name="Чай Azerçay 100г", category="Напитки", store_name="Bravo", base_weight=0.15, url="http://test.com/1", css_selector=".price"),
-                Product(name="Хлеб заводской", category="Хлеб", store_name="Bazarstore", base_weight=0.35, url="http://test.com/2", css_selector=".price"),
-                Product(name="Говядина 1кг", category="Мясо", store_name="Araz", base_weight=0.50, url="http://test.com/3", css_selector=".price")
+                Product(
+                    name="Sugar (Şəkər tozu) 1kg", 
+                    category="Groceries", 
+                    store_name="Bazarstore", 
+                    base_weight=0.30, 
+                    url="https://bazarstore.az/products/səkər-tozu-kg", 
+                    css_selector=".price-item--regular" 
+                ),
+                Product(
+                    name="Eggs (Giləzi 10 pcs)", 
+                    category="Groceries", 
+                    store_name="Bazarstore", 
+                    base_weight=0.30, 
+                    url="https://bazarstore.az/products/gilezi-yumurta-qablasdirma-10-lu", 
+                    css_selector=".price-item--regular"
+                ),
+                Product(
+                    name="Butter Spread (Kalinka 200g)", 
+                    category="Dairy", 
+                    store_name="Bazarstore", 
+                    base_weight=0.40, 
+                    url="https://bazarstore.az/products/kalinka-bitki-yag-spredi-200-q-82", 
+                    css_selector=".price-item--regular"
+                )
             ])
             session.commit()
 
         products = session.query(Product).all()
         
-        # 2. Генерируем историю за 10 дней для красивого графика (только при первом запуске)
-        if session.query(PriceHistory).count() == 0:
-            logger.info("Генерируем исторические данные за последние 10 дней для демо...")
-            base_prices = {"Чай Azerçay 100г": 2.50, "Хлеб заводской": 0.70, "Говядина 1кг": 14.50}
+        # 2. Daily collection of REAL prices
+        logger.info("Starting real price parsing...")
+        for product in products:
+            logger.info(f"Scraping price for: {product.name} ({product.store_name})")
             
-            for days_ago in range(10, -1, -1):
-                past_date = datetime.now() - timedelta(days=days_ago)
-                for product in products:
-                    trend = (10 - days_ago) * 0.003 # Легкая инфляция
-                    noise = random.uniform(-0.02, 0.03)
-                    price = round(base_prices[product.name] * (1 + trend + noise), 2)
-                    
-                    session.add(PriceHistory(product_id=product.id, current_price=price, date=past_date))
-            session.commit()
-            logger.info("Исторические данные успешно сгенерированы!")
-        else:
-            # 3. Ежедневный запуск (обычный режим)
-            logger.info("Сбор свежих цен на сегодня...")
-            for product in products:
-                # В продакшене: price = scraper.get_price(product.url, product.css_selector)
-                last_price = session.query(PriceHistory).filter_by(product_id=product.id).order_by(PriceHistory.date.desc()).first().current_price
-                new_price = round(last_price * random.uniform(0.99, 1.02), 2) # Имитация изменения цены
-                
-                session.add(PriceHistory(product_id=product.id, current_price=new_price, date=datetime.now()))
-            session.commit()
-            logger.info("Свежие цены добавлены.")
+            # RUN THE REAL SCRAPER
+            real_price = scraper.get_price(product.url, product.css_selector)
+            
+            if real_price is not None:
+                # If the price is found successfully, save to DB with current date
+                session.add(PriceHistory(product_id=product.id, current_price=real_price, date=datetime.now()))
+                logger.info(f"✅ Success! Price: {real_price} ₼")
+            else:
+                # If the site changed its design or the selector is wrong
+                logger.warning(f"❌ Failed to find price for {product.name}. Check URL or selector.")
+            
+            # Mandatory pause (2 seconds) to avoid anti-bot blocks from the store
+            time.sleep(2) 
+            
+        session.commit()
+        logger.info("Price collection completed.")
 
     except Exception as e:
         session.rollback()
-        logger.error(f"Ошибка: {e}")
+        logger.error(f"Critical error: {e}")
     finally:
         session.close()
 
